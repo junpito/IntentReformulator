@@ -3,6 +3,9 @@
 Complete technical documentation for every feature, class, function, and concept
 in this project. Designed to help you understand the codebase from top to bottom.
 
+> **Note:** A multi-provider version (Gemini + OpenAI) is available on the
+> [`feature/multi-provider`](https://github.com/junpito/IntentReformulator/tree/feature/multi-provider) branch.
+
 ---
 
 ## Table of Contents
@@ -12,7 +15,7 @@ in this project. Designed to help you understand the codebase from top to bottom
 3. [File-by-File Breakdown](#3-file-by-file-breakdown)
    - 3.1 [prompts/intent_extraction.yaml](#31-promptsintent_extractionyaml)
    - 3.2 [src/memory.py — ChatMemory](#32-srcmemorypy--chatmemory)
-   - 3.3 [src/llm_client.py — GeminiClient](#33-srcllm_clientpy--geminiclient)
+   - 3.3 [src/llm_client.py — OpenAIClient](#33-srcllm_clientpy--openaiclient)
    - 3.4 [src/reformulator.py — IntentReformulator](#34-srcreformulatorpy--intentreformulator)
    - 3.5 [main.py — CLI Entry Point](#35-mainpy--cli-entry-point)
    - 3.6 [tests/test_multiturn.py — Test Suite](#36-teststest_multiturnpy--test-suite)
@@ -27,7 +30,7 @@ in this project. Designed to help you understand the codebase from top to bottom
 This project is a **Non-Binding Intent Reformulator**. Its job:
 
 1. Read a multi-turn chat conversation between a customer and a support bot
-2. Use an LLM (Google Gemini) to extract **what the customer wants** (intent + object)
+2. Use **OpenAI ChatGPT** to extract **what the customer wants** (intent + object)
 3. **Propose** the extracted intent to the user for confirmation
 4. Only after user confirms, the intent is "committed" (ready to be sent to V1 Kernel)
 
@@ -56,24 +59,24 @@ This project is a **Non-Binding Intent Reformulator**. Its job:
 └──────────────┘                           │
                                            ▼
                                  ┌────────────────────┐
-                                 │   GeminiClient      │
+                                 │   OpenAIClient      │
                                  │   (llm_client.py)   │
                                  │                     │
                                  │ Sends prompt +      │
-                                 │ history to Gemini   │
+                                 │ history to ChatGPT  │
                                  │ API, returns        │
                                  │ structured JSON     │
                                  └─────────┬──────────┘
                                            │
                                            ▼
                                  ┌────────────────────┐
-                                 │  Google Gemini API  │
+                                 │   OpenAI API        │
                                  │  (External Service) │
                                  └────────────────────┘
 ```
 
 **Data flows in one direction:**
-User Input → Memory → Reformulator → LLM Client → Gemini API → back up → User Confirmation
+User Input → Memory → Reformulator → LLM Client → OpenAI API → back up → User Confirmation
 
 ---
 
@@ -168,9 +171,9 @@ keeps only the most recent, relevant messages.
 
 ---
 
-### 3.3 `src/llm_client.py` — GeminiClient
+### 3.3 `src/llm_client.py` — OpenAIClient
 
-**Purpose:** Wraps the Google Gemini API. Sends chat history + prompt, gets back structured JSON.
+**Purpose:** Wraps the OpenAI ChatGPT API. Sends chat history + prompt, gets back structured JSON.
 
 #### Model: `IntentOutput`
 
@@ -184,21 +187,20 @@ A **Pydantic model** that defines the expected LLM output shape:
 - `verb` — The extracted intent (e.g., `"refund"`, `"cancel_order"`, `"unknown"`)
 - `object` — The target item/order (e.g., `"#001"`, `"red shoes"`) or `None`
 
-**Why Pydantic?** Two reasons:
+**Why Pydantic?**
 1. **Validation** — Pydantic automatically checks that `verb` is a string and `object`
    is either a string or null. If the LLM returns garbage, parsing will fail cleanly.
-2. **Schema enforcement** — The Gemini API accepts a `response_schema` parameter.
-   When you pass a Pydantic model, Gemini is *forced* to output JSON matching that
-   exact structure. This eliminates most parsing issues.
+2. **Schema enforcement** — OpenAI's `response_format={"type": "json_object"}` forces
+   JSON output. Pydantic then validates the structure matches `IntentOutput`.
 
-#### Class: `GeminiClient`
+#### Class: `OpenAIClient`
 
 ```python
-class GeminiClient:
+class OpenAIClient:
     def __init__(
         self,
         api_key: str,
-        model: str = "gemini-2.5-flash",
+        model: str = "gpt-4o-mini",
         max_retries: int = 3,
         retry_delay: float = 1.0,
     )
@@ -207,31 +209,41 @@ class GeminiClient:
 **Constructor Parameters:**
 | Parameter | Default | What It Does |
 |-----------|---------|-------------|
-| `api_key` | (required) | Your Google AI Studio API key |
-| `model` | `"gemini-2.5-flash"` | Which Gemini model to use. Flash is fast and cheap. |
+| `api_key` | (required) | Your OpenAI API key |
+| `model` | `"gpt-4o-mini"` | Which ChatGPT model to use. gpt-4o-mini is fast and cheap. |
 | `max_retries` | `3` | How many times to retry if the API call fails |
 | `retry_delay` | `1.0` | Base delay (seconds) between retries. Uses exponential backoff: 1s, 2s, 4s... |
 
 **Initialization:**
 ```python
-self.client = genai.Client(api_key=api_key)
-# Creates the official Google GenAI SDK client
+self.client = OpenAI(api_key=api_key)
+# Creates the official OpenAI SDK client
 ```
 
-#### Methods:
-
-##### `generate_structured_output(system_prompt, chat_history) → IntentOutput`
+#### Method: `generate_structured_output(system_prompt, chat_history) → IntentOutput`
 
 This is the main method. It:
 
-1. **Converts** chat history to Gemini's format via `_build_contents()`
-2. **Calls** the Gemini API with:
-   - `system_instruction` — The system prompt (tells LLM how to behave)
-   - `response_mime_type="application/json"` — Forces JSON output
-   - `response_schema=IntentOutput` — Forces output to match the Pydantic model
+1. **Builds messages** — prepends `{"role": "system", "content": system_prompt}` then appends chat history
+2. **Calls** the OpenAI API with:
+   - `messages` — System prompt + chat history
+   - `response_format={"type": "json_object"}` — Forces JSON output
    - `temperature=0` — Makes output deterministic (same input = same output)
-3. **Parses** the response into an `IntentOutput` object
+3. **Parses** the response with `IntentOutput.model_validate_json()`
 4. **Retries** on failure with exponential backoff
+
+**How messages are built:**
+```python
+messages = [
+    {"role": "system", "content": "You are a data extraction assistant..."},
+    {"role": "user", "content": "Check order #001"},
+    {"role": "assistant", "content": "Order #001 is being shipped."},
+    {"role": "user", "content": "Cancel it."},
+]
+```
+
+OpenAI uses `"assistant"` for bot messages — the same format as our internal
+`ChatMemory`, so no role translation is needed.
 
 **Retry Logic Explained:**
 ```
@@ -244,21 +256,6 @@ Attempt 3: Call API
 ```
 
 This handles transient errors like network timeouts or rate limiting.
-
-##### `_build_contents(chat_history) → list[Content]` (static method)
-
-Converts our internal chat format to Gemini's expected format:
-
-```python
-# Our format:
-{"role": "assistant", "content": "Hello"}
-
-# Gemini's format (note: "assistant" → "model"):
-Content(role="model", parts=[Part.from_text(text="Hello")])
-```
-
-**Important:** Gemini uses `"model"` instead of `"assistant"` for bot messages.
-This method handles that translation.
 
 ---
 
@@ -286,11 +283,11 @@ Anything else (including LLM hallucinations) is rejected as AMBIGUOUS.
 
 ```python
 class IntentReformulator:
-    def __init__(self, llm_client: GeminiClient, system_prompt: str)
+    def __init__(self, llm_client: OpenAIClient, system_prompt: str)
 ```
 
 **Constructor Parameters:**
-- `llm_client` — An instance of `GeminiClient`
+- `llm_client` — An instance of `OpenAIClient`
 - `system_prompt` — The prompt string loaded from YAML
 
 ##### `process_chat(chat_history) → dict`
@@ -334,42 +331,30 @@ The calling code (main.py) must ask the user to confirm before acting on it.
 
 ##### `load_system_prompt(path) → str`
 
-```python
-def load_system_prompt(path: str = "prompts/intent_extraction.yaml") -> str
-```
-
 Opens the YAML file, parses it with `yaml.safe_load()`, and returns the
 `system_prompt` value as a plain string.
 
-##### `print_banner() → None`
+##### `print_banner(model) → None`
 
-Prints a welcome message when the CLI starts. Purely cosmetic.
+Prints a welcome message showing the current model name.
 
 ##### `format_proposal(proposal) → str`
 
-```python
-def format_proposal(proposal: dict) -> str
-```
-
-Takes a proposal dict (from `IntentReformulator.process_chat()`) and formats
-it into a human-readable confirmation question:
+Takes a proposal dict and formats it into a human-readable confirmation question:
 
 ```
 Input:  {"status": "PROPOSED", "intent": "cancel_order", "target": "#001"}
 Output: 'I understand you want to perform "Cancel Order" for "#001". Is this correct?'
 ```
 
-The intent is formatted with `replace("_", " ").title()` so `"cancel_order"`
-becomes `"Cancel Order"`.
-
 ##### `main() → None`
 
-The main loop. Here's the complete flow:
+The main loop:
 
 ```
-1. Load .env → get API key
+1. Load .env → get OPENAI_API_KEY + OPENAI_MODEL
 2. Validate API key exists
-3. Initialize: GeminiClient → ChatMemory → IntentReformulator
+3. Initialize: OpenAIClient → ChatMemory → IntentReformulator
 4. LOOP:
    a. Get user input
    b. If "quit"/"exit" → break
@@ -385,13 +370,6 @@ The main loop. Here's the complete flow:
       - Add assistant message to memory (so context is preserved)
 ```
 
-**Key detail on AMBIGUOUS handling:** When the intent is ambiguous, the bot's
-clarification message is added back to memory. This way, if the user responds
-with a clearer message, the LLM can see the full context including the clarification.
-
-**Key detail on PROPOSED + confirmed:** After a successful commit, memory is cleared.
-This starts a fresh conversation for the next request.
-
 ---
 
 ### 3.6 `tests/test_multiturn.py` — Test Suite
@@ -400,8 +378,7 @@ This starts a fresh conversation for the next request.
 
 #### Unit Tests (no API key needed)
 
-These use `unittest.mock.MagicMock` to simulate the LLM. The mock returns
-a predetermined `IntentOutput` so we can test the logic without calling the API.
+These use `unittest.mock.MagicMock` to simulate the LLM.
 
 | Test | What It Verifies |
 |------|-----------------|
@@ -417,22 +394,9 @@ a predetermined `IntentOutput` so we can test the logic without calling the API.
 | `test_empty_history_returns_ambiguous` | Empty history returns AMBIGUOUS without calling LLM |
 | `test_all_allowed_intents_are_accepted` | All 6 intents produce PROPOSED status |
 
-##### How Mocking Works:
-
-```python
-# Create a fake LLM client that always returns a fixed answer:
-mock_client = MagicMock(spec=GeminiClient)
-mock_client.generate_structured_output.return_value = IntentOutput(
-    verb="cancel_order", object="#001"
-)
-
-# Now when reformulator calls self.llm.generate_structured_output(...),
-# it gets the fixed answer instead of calling the real Gemini API.
-```
-
 #### Integration Tests (API key required)
 
-These call the **real Gemini API** to verify end-to-end behavior.
+These call the **real OpenAI API** to verify end-to-end behavior.
 
 | Test | What It Verifies |
 |------|-----------------|
@@ -440,13 +404,12 @@ These call the **real Gemini API** to verify end-to-end behavior.
 | `test_ambiguous_integration` | Real LLM returns unknown for "I'm confused." |
 | `test_refund_request_integration` | Real LLM extracts refund intent correctly |
 
-These tests are **skipped automatically** if `GEMINI_API_KEY` is not set in `.env`.
+These tests are **skipped automatically** if `OPENAI_API_KEY` is not set in `.env`.
 
 **Run commands:**
 ```bash
 pytest tests/ -v                    # Unit tests only
 pytest tests/ -v -m integration     # Integration tests only
-pytest tests/ -v -m "integration or not integration"  # All tests
 ```
 
 ---
@@ -456,7 +419,7 @@ pytest tests/ -v -m "integration or not integration"  # All tests
 ### 4.1 Non-Binding Proposal
 
 The LLM's output is **never executed directly**. It's always a "proposal" that
-the user must confirm. This is a safety pattern:
+the user must confirm:
 
 ```
 LLM says: cancel_order for #001
@@ -471,22 +434,9 @@ This prevents LLM hallucinations from causing real actions.
 
 ### 4.2 J01 Commit Boundary Event
 
-This is the formal name for the "handoff point" between the LLM module (this project)
-and the V1 Deterministic Kernel (your teammate's project). Currently it's just a
-printed message, but in production it would be a structured event sent via HTTP/queue:
-
-```python
-# What it looks like now (CLI):
-{
-    "Intent": "cancel_order",
-    "Target": "#001",
-    "Status": "COMMITTED"
-}
-
-# What it would look like in production:
-# POST /v1/kernel/commit
-# Body: {"event": "J01", "intent": "cancel_order", "target": "#001", "session_id": "abc123"}
-```
+The formal "handoff point" between the LLM module (this project)
+and the V1 Deterministic Kernel. Currently it's just a printed message,
+but in production it would be a structured event sent via HTTP/queue.
 
 ### 4.3 Epistemic Boundary
 
@@ -496,21 +446,21 @@ This project is the **boundary between uncertain knowledge (LLM) and certain act
 - **At the boundary:** User confirms (Yes/No)
 - **After the boundary:** Deterministic code executes with 100% certainty
 
-### 4.4 Structured Output (Pydantic + Gemini)
+### 4.4 Structured Output (Pydantic + OpenAI)
 
 Instead of asking the LLM to output free text and then parsing it with regex,
-we use Gemini's `response_schema` feature:
+we use OpenAI's JSON mode:
 
 ```python
-config=types.GenerateContentConfig(
-    response_mime_type="application/json",  # Force JSON output
-    response_schema=IntentOutput,           # Force this exact shape
-    temperature=0,                          # Deterministic output
+response = client.chat.completions.create(
+    response_format={"type": "json_object"},  # Force JSON output
+    temperature=0,
 )
+# Then validate with Pydantic:
+IntentOutput.model_validate_json(response.choices[0].message.content)
 ```
 
-The Gemini API **guarantees** the output will be valid JSON matching `IntentOutput`.
-This eliminates parsing errors and makes the system much more reliable.
+This ensures the output is valid JSON, and Pydantic validates the structure.
 
 ### 4.5 Temperature = 0
 
@@ -521,15 +471,12 @@ temperature=0
 Temperature controls randomness in LLM output:
 - `temperature=0` → Always picks the most likely answer (deterministic)
 - `temperature=1` → More creative/random
-- `temperature=2` → Very random
 
-For intent extraction, we want consistency: same input should always give the same
-output. That's why we use `temperature=0`.
+For intent extraction, we want consistency. That's why we use `temperature=0`.
 
 ### 4.6 Sliding Window
 
-LLMs have a maximum context size (number of tokens they can process). If chat
-history is very long, we need to cut it. The sliding window keeps the N most recent
+LLMs have a maximum context size. The sliding window keeps the N most recent
 messages and discards older ones:
 
 ```
@@ -539,65 +486,44 @@ Full history:  [A, B, C, D, E, F]
 After window:  [      C, D, E, F]  ← Only last 4 kept
 ```
 
-This is a trade-off: we lose old context but stay within token limits.
-
 ---
 
 ## 5. Complete Data Flow Walkthrough
-
-Let's trace through a real scenario step by step.
 
 **Scenario:** User asks about order #001, then wants to cancel it.
 
 ### Step 1: User types "Check status of order #001"
 
 ```python
-# main.py line 97
 memory.add_message("user", "Check status of order #001")
-# memory._history = [{"role": "user", "content": "Check status of order #001"}]
 ```
 
 ### Step 2: Reformulator processes
 
 ```python
-# main.py line 101
 proposal = reformulator.process_chat(memory.get_history())
 
-# Inside reformulator.process_chat():
-#   1. chat_history is not empty → proceed
-#   2. Calls llm.generate_structured_output(system_prompt, chat_history)
-
-# Inside llm_client.generate_structured_output():
-#   1. _build_contents() converts: {"role":"user"} → Content(role="user")
-#   2. Sends to Gemini API with system_prompt + temperature=0
-#   3. Gemini returns: {"verb": "order_status", "object": "#001"}
+# Inside reformulator → calls llm_client.generate_structured_output()
+# Inside OpenAIClient:
+#   1. Builds messages: [system_prompt, user_msg]
+#   2. Sends to OpenAI with temperature=0, response_format=json_object
+#   3. ChatGPT returns: {"verb": "order_status", "object": "#001"}
 #   4. Parsed into: IntentOutput(verb="order_status", object="#001")
-
 # Back in reformulator:
-#   3. verb = "order_status" → is in ALLOWED_INTENTS? YES
-#   4. Returns: {"status": "PROPOSED", "intent": "order_status", "target": "#001"}
+#   verb = "order_status" → in ALLOWED_INTENTS? YES
+#   Returns: {"status": "PROPOSED", "intent": "order_status", "target": "#001"}
 ```
 
-### Step 3: User sees proposal, confirms, memory clears
-
-Now imagine the bot replied and user says "Actually, cancel it."
+### Step 3: Bot replies, user says "Actually, cancel it."
 
 ```python
 memory.add_message("assistant", "Order #001 is being shipped.")
 memory.add_message("user", "Actually, cancel it.")
-
-# memory._history = [
-#   {"role": "user", "content": "Check status of order #001"},
-#   {"role": "assistant", "content": "Order #001 is being shipped."},
-#   {"role": "user", "content": "Actually, cancel it."},
-# ]
 ```
 
 ### Step 4: LLM resolves "it" from context
 
-The LLM sees the full history. It knows "it" refers to order #001 from the
-first message. It outputs:
-
+The LLM sees the full history and knows "it" = order #001. It outputs:
 ```json
 {"verb": "cancel_order", "object": "#001"}
 ```
@@ -609,7 +535,6 @@ first message. It outputs:
   Intent : cancel_order
   Target : #001
   Status : COMMITTED
->> This data is now ready to be sent to V1 Deterministic Kernel.
 ```
 
 Memory is cleared. Ready for next conversation.
@@ -617,8 +542,6 @@ Memory is cleared. Ready for next conversation.
 ---
 
 ## 6. How to Add New Intents
-
-If you need to support a new intent (e.g., `track_delivery`):
 
 ### Step 1: Update `ALLOWED_INTENTS` in `src/reformulator.py`
 
@@ -661,6 +584,4 @@ def test_track_delivery_proposal(self):
 ```
 
 **Important:** You must update BOTH `ALLOWED_INTENTS` (code) AND the YAML prompt
-(LLM instruction). If you only update one, the system won't work correctly:
-- Updated code only → LLM won't output the new intent (not in its instructions)
-- Updated prompt only → Code will reject the new intent as AMBIGUOUS
+(LLM instruction). If you only update one, the system won't work correctly.

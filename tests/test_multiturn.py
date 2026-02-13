@@ -2,7 +2,7 @@
 Golden Test Cases for LLM Intent Reformulator
 
 Contains both unit tests (with mocked LLM) and integration tests (with real API).
-Unit tests run without an API key; integration tests require GEMINI_API_KEY in .env.
+Unit tests run without an API key; integration tests require OPENAI_API_KEY in .env.
 
 Run unit tests:     pytest tests/ -v
 Run all tests:      pytest tests/ -v -m "integration or not integration"
@@ -17,7 +17,7 @@ from unittest.mock import MagicMock
 import pytest
 from dotenv import load_dotenv
 
-from src.llm_client import GeminiClient, IntentOutput
+from src.llm_client import OpenAIClient, IntentOutput
 from src.memory import ChatMemory
 from src.reformulator import ALLOWED_INTENTS, IntentReformulator
 
@@ -84,7 +84,7 @@ class TestIntentReformulatorMocked:
 
     def _make_reformulator(self, verb: str, obj: str | None) -> IntentReformulator:
         """Helper to create a reformulator with a mocked LLM returning fixed output."""
-        mock_client = MagicMock(spec=GeminiClient)
+        mock_client = MagicMock(spec=OpenAIClient)
         mock_client.generate_structured_output.return_value = IntentOutput(
             verb=verb, object=obj
         )
@@ -160,7 +160,7 @@ class TestIntentReformulatorMocked:
 
     def test_empty_history_returns_ambiguous(self):
         """Empty chat history should return AMBIGUOUS."""
-        mock_client = MagicMock(spec=GeminiClient)
+        mock_client = MagicMock(spec=OpenAIClient)
         reformulator = IntentReformulator(
             llm_client=mock_client, system_prompt="test prompt"
         )
@@ -182,14 +182,14 @@ class TestIntentReformulatorMocked:
 
 
 # ===========================================================================
-# Integration Tests — Requires real GEMINI_API_KEY
+# Integration Tests — Requires real OPENAI_API_KEY
 # ===========================================================================
 
 load_dotenv()
 
 HAS_API_KEY = bool(
-    os.getenv("GEMINI_API_KEY")
-    and os.getenv("GEMINI_API_KEY") != "your-api-key-here"
+    os.getenv("OPENAI_API_KEY")
+    and os.getenv("OPENAI_API_KEY") != "your-api-key-here"
 )
 
 
@@ -201,15 +201,15 @@ def _load_system_prompt() -> str:
 
 
 @pytest.mark.integration
-@pytest.mark.skipif(not HAS_API_KEY, reason="GEMINI_API_KEY not set")
-class TestIntegrationWithGemini:
-    """Integration tests that call the real Gemini API."""
+@pytest.mark.skipif(not HAS_API_KEY, reason="OPENAI_API_KEY not set")
+class TestIntegrationWithOpenAI:
+    """Integration tests that call the real OpenAI API."""
 
     @pytest.fixture
     def reformulator(self) -> IntentReformulator:
-        api_key = os.getenv("GEMINI_API_KEY")
-        model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-        client = GeminiClient(api_key=api_key, model=model)
+        api_key = os.getenv("OPENAI_API_KEY")
+        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        client = OpenAIClient(api_key=api_key, model=model)
         prompt = _load_system_prompt()
         return IntentReformulator(llm_client=client, system_prompt=prompt)
 

@@ -4,6 +4,8 @@ LLM Intent Reformulator — Interactive CLI Entry Point
 This is the main entry point for testing the Non-Binding Intent Reformulator.
 It provides an interactive CLI where you can chat with the system and see
 how intents are extracted and proposed for confirmation.
+
+Uses OpenAI ChatGPT as the LLM provider.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ import sys
 import yaml
 from dotenv import load_dotenv
 
-from src.llm_client import GeminiClient
+from src.llm_client import OpenAIClient
 from src.memory import ChatMemory
 from src.reformulator import IntentReformulator
 
@@ -36,10 +38,11 @@ def load_system_prompt(path: str = "prompts/intent_extraction.yaml") -> str:
     return data["system_prompt"]
 
 
-def print_banner() -> None:
+def print_banner(model: str) -> None:
     """Print a welcome banner."""
     print("\n" + "=" * 60)
     print("  LLM Intent Reformulator — Interactive CLI")
+    print(f"  Provider: OpenAI | Model: {model}")
     print("  Type your messages to chat. Type 'quit' or 'exit' to stop.")
     print("=" * 60 + "\n")
 
@@ -61,22 +64,22 @@ def main() -> None:
     # Load environment variables
     load_dotenv()
 
-    api_key = os.getenv("GEMINI_API_KEY")
+    api_key = os.getenv("OPENAI_API_KEY")
     if not api_key or api_key == "your-api-key-here":
-        print("\n[ERROR] GEMINI_API_KEY not found or not configured.")
-        print("Please copy .env.example to .env and add your Gemini API key.")
-        print("Get your key at: https://aistudio.google.com/app/apikey\n")
+        print("\n[ERROR] OPENAI_API_KEY not found or not configured.")
+        print("Please set OPENAI_API_KEY in your .env file.")
+        print("Get your key at: https://platform.openai.com/api-keys\n")
         sys.exit(1)
 
-    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
     # Initialize components
     system_prompt = load_system_prompt()
-    llm_client = GeminiClient(api_key=api_key, model=model)
+    llm_client = OpenAIClient(api_key=api_key, model=model)
     memory = ChatMemory(max_turns=10)
     reformulator = IntentReformulator(llm_client=llm_client, system_prompt=system_prompt)
 
-    print_banner()
+    print_banner(model)
 
     while True:
         # Get user input

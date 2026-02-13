@@ -4,6 +4,9 @@ LLM Intent Reformulator — Interactive CLI Entry Point
 This is the main entry point for testing the Non-Binding Intent Reformulator.
 It provides an interactive CLI where you can chat with the system and see
 how intents are extracted and proposed for confirmation.
+
+Supports multiple LLM providers: Google Gemini and OpenAI ChatGPT.
+Configure via .env file (see .env.example).
 """
 
 from __future__ import annotations
@@ -15,7 +18,7 @@ import sys
 import yaml
 from dotenv import load_dotenv
 
-from src.llm_client import GeminiClient
+from src.llm_client import create_llm_client
 from src.memory import ChatMemory
 from src.reformulator import IntentReformulator
 
@@ -36,10 +39,11 @@ def load_system_prompt(path: str = "prompts/intent_extraction.yaml") -> str:
     return data["system_prompt"]
 
 
-def print_banner() -> None:
+def print_banner(provider: str, model: str) -> None:
     """Print a welcome banner."""
     print("\n" + "=" * 60)
     print("  LLM Intent Reformulator — Interactive CLI")
+    print(f"  Provider: {provider.upper()} | Model: {model}")
     print("  Type your messages to chat. Type 'quit' or 'exit' to stop.")
     print("=" * 60 + "\n")
 
@@ -56,27 +60,57 @@ def format_proposal(proposal: dict) -> str:
     return f'I understand you want to perform "{intent_display}". Is this correct?'
 
 
+def get_provider_config() -> tuple[str, str, str]:
+    """
+    Read LLM provider configuration from environment variables.
+
+    Returns:
+        Tuple of (provider, api_key, model).
+    """
+    provider = os.getenv("LLM_PROVIDER", "gemini").lower().strip()
+
+    if provider == "gemini":
+        api_key = os.getenv("GEMINI_API_KEY", "")
+        model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        if not api_key or api_key == "your-api-key-here":
+            print("\n[ERROR] GEMINI_API_KEY not found or not configured.")
+            print("Please set GEMINI_API_KEY in your .env file.")
+            print("Get your key at: https://aistudio.google.com/app/apikey\n")
+            sys.exit(1)
+
+    elif provider == "openai":
+        api_key = os.getenv("OPENAI_API_KEY", "")
+        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        if not api_key or api_key == "your-api-key-here":
+            print("\n[ERROR] OPENAI_API_KEY not found or not configured.")
+            print("Please set OPENAI_API_KEY in your .env file.")
+            print("Get your key at: https://platform.openai.com/api-keys\n")
+            sys.exit(1)
+
+    else:
+        print(f"\n[ERROR] Unknown LLM_PROVIDER '{provider}'.")
+        print("Supported providers: gemini, openai")
+        print("Set LLM_PROVIDER in your .env file.\n")
+        sys.exit(1)
+
+    return provider, api_key, model
+
+
 def main() -> None:
     """Main interactive loop."""
     # Load environment variables
     load_dotenv()
 
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key or api_key == "your-api-key-here":
-        print("\n[ERROR] GEMINI_API_KEY not found or not configured.")
-        print("Please copy .env.example to .env and add your Gemini API key.")
-        print("Get your key at: https://aistudio.google.com/app/apikey\n")
-        sys.exit(1)
-
-    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    # Get provider config
+    provider, api_key, model = get_provider_config()
 
     # Initialize components
     system_prompt = load_system_prompt()
-    llm_client = GeminiClient(api_key=api_key, model=model)
+    llm_client = create_llm_client(provider=provider, api_key=api_key, model=model)
     memory = ChatMemory(max_turns=10)
     reformulator = IntentReformulator(llm_client=llm_client, system_prompt=system_prompt)
 
-    print_banner()
+    print_banner(provider, model)
 
     while True:
         # Get user input

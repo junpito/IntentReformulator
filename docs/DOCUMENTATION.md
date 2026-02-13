@@ -27,7 +27,7 @@ in this project. Designed to help you understand the codebase from top to bottom
 This project is a **Non-Binding Intent Reformulator**. Its job:
 
 1. Read a multi-turn chat conversation between a customer and a support bot
-2. Use an LLM (Google Gemini) to extract **what the customer wants** (intent + object)
+2. Use an LLM (**Google Gemini** or **OpenAI ChatGPT**) to extract **what the customer wants** (intent + object)
 3. **Propose** the extracted intent to the user for confirmation
 4. Only after user confirms, the intent is "committed" (ready to be sent to V1 Kernel)
 
@@ -56,24 +56,23 @@ This project is a **Non-Binding Intent Reformulator**. Its job:
 └──────────────┘                           │
                                            ▼
                                  ┌────────────────────┐
-                                 │   GeminiClient      │
-                                 │   (llm_client.py)   │
+                                 │  LLM Client         │
+                                 │  (llm_client.py)    │
                                  │                     │
-                                 │ Sends prompt +      │
-                                 │ history to Gemini   │
-                                 │ API, returns        │
-                                 │ structured JSON     │
+                                 │ GeminiClient  OR    │
+                                 │ OpenAIClient        │
+                                 │ (via factory)       │
                                  └─────────┬──────────┘
                                            │
                                            ▼
                                  ┌────────────────────┐
-                                 │  Google Gemini API  │
-                                 │  (External Service) │
+                                 │  Gemini / OpenAI    │
+                                 │  API (External)     │
                                  └────────────────────┘
 ```
 
 **Data flows in one direction:**
-User Input → Memory → Reformulator → LLM Client → Gemini API → back up → User Confirmation
+User Input → Memory → Reformulator → LLM Client → Gemini/OpenAI API → back up → User Confirmation
 
 ---
 
@@ -168,9 +167,11 @@ keeps only the most recent, relevant messages.
 
 ---
 
-### 3.3 `src/llm_client.py` — GeminiClient
+### 3.3 `src/llm_client.py` — LLM Clients (Gemini + OpenAI)
 
-**Purpose:** Wraps the Google Gemini API. Sends chat history + prompt, gets back structured JSON.
+**Purpose:** Provides wrappers for multiple LLM providers. Both clients share the
+same interface (`BaseLLMClient`), so the rest of the code doesn't care which provider
+is used. A factory function (`create_llm_client`) creates the right client based on config.
 
 #### Model: `IntentOutput`
 
@@ -180,60 +181,72 @@ class IntentOutput(BaseModel):
     object: str | None = None
 ```
 
-A **Pydantic model** that defines the expected LLM output shape:
+A **Pydantic model** that defines the expected LLM output shape (shared by all providers):
 - `verb` — The extracted intent (e.g., `"refund"`, `"cancel_order"`, `"unknown"`)
 - `object` — The target item/order (e.g., `"#001"`, `"red shoes"`) or `None`
 
 **Why Pydantic?** Two reasons:
 1. **Validation** — Pydantic automatically checks that `verb` is a string and `object`
    is either a string or null. If the LLM returns garbage, parsing will fail cleanly.
-2. **Schema enforcement** — The Gemini API accepts a `response_schema` parameter.
-   When you pass a Pydantic model, Gemini is *forced* to output JSON matching that
-   exact structure. This eliminates most parsing issues.
+2. **Schema enforcement** — Both Gemini (`response_schema`) and OpenAI (`response_format`)
+   support forced JSON output. Pydantic validates the result after parsing.
 
-#### Class: `GeminiClient`
+#### Abstract Base Class: `BaseLLMClient`
 
 ```python
-class GeminiClient:
-    def __init__(
-        self,
-        api_key: str,
-        model: str = "gemini-2.5-flash",
-        max_retries: int = 3,
-        retry_delay: float = 1.0,
-    )
+class BaseLLMClient(ABC):
+    @abstractmethod
+    def generate_structured_output(self, system_prompt, chat_history) -> IntentOutput: ...
 ```
 
-**Constructor Parameters:**
+All LLM clients must implement `generate_structured_output()`. This is the **interface
+contract** that `IntentReformulator` depends on — not any specific provider.
+
+#### Class: `GeminiClient(BaseLLMClient)`
+
 | Parameter | Default | What It Does |
 |-----------|---------|-------------|
 | `api_key` | (required) | Your Google AI Studio API key |
 | `model` | `"gemini-2.5-flash"` | Which Gemini model to use. Flash is fast and cheap. |
 | `max_retries` | `3` | How many times to retry if the API call fails |
-| `retry_delay` | `1.0` | Base delay (seconds) between retries. Uses exponential backoff: 1s, 2s, 4s... |
+| `retry_delay` | `1.0` | Base delay (seconds) between retries. Uses exponential backoff. |
 
-**Initialization:**
+**How it works:**
+1. Converts chat history to Gemini format (`"assistant"` → `"model"`) via `_build_contents()`
+2. Calls `client.models.generate_content()` with `response_schema=IntentOutput`
+3. Gemini is *forced* to output JSON matching the Pydantic model
+4. Retries with exponential backoff on failure
+
+#### Class: `OpenAIClient(BaseLLMClient)`
+
+| Parameter | Default | What It Does |
+|-----------|---------|-------------|
+| `api_key` | (required) | Your OpenAI API key |
+| `model` | `"gpt-4o-mini"` | Which OpenAI model to use. |
+| `max_retries` | `3` | How many times to retry if the API call fails |
+| `retry_delay` | `1.0` | Base delay (seconds) between retries. Uses exponential backoff. |
+
+**How it works:**
+1. Prepends system prompt as `{"role": "system", "content": system_prompt}`
+2. Appends chat history as-is (OpenAI uses `"assistant"` — same as our format!)
+3. Calls `client.chat.completions.create()` with `response_format={"type": "json_object"}`
+4. Parses JSON response into `IntentOutput`
+5. Retries with exponential backoff on failure
+
+**Key difference from Gemini:** OpenAI uses `"assistant"` role (matching our internal
+format), while Gemini uses `"model"`. The clients handle this translation internally.
+
+#### Factory Function: `create_llm_client(provider, api_key, model)`
+
 ```python
-self.client = genai.Client(api_key=api_key)
-# Creates the official Google GenAI SDK client
+client = create_llm_client(provider="gemini", api_key="...", model="gemini-2.5-flash")
+client = create_llm_client(provider="openai", api_key="...", model="gpt-4o-mini")
 ```
 
-#### Methods:
+Creates the right client based on the `provider` string. This is called by `main.py`
+based on the `LLM_PROVIDER` value in `.env`.
 
-##### `generate_structured_output(system_prompt, chat_history) → IntentOutput`
-
-This is the main method. It:
-
-1. **Converts** chat history to Gemini's format via `_build_contents()`
-2. **Calls** the Gemini API with:
-   - `system_instruction` — The system prompt (tells LLM how to behave)
-   - `response_mime_type="application/json"` — Forces JSON output
-   - `response_schema=IntentOutput` — Forces output to match the Pydantic model
-   - `temperature=0` — Makes output deterministic (same input = same output)
-3. **Parses** the response into an `IntentOutput` object
-4. **Retries** on failure with exponential backoff
-
-**Retry Logic Explained:**
+**Retry Logic (both providers):**
 ```
 Attempt 1: Call API
   → If fails: wait 1 second
@@ -242,23 +255,6 @@ Attempt 2: Call API
 Attempt 3: Call API
   → If fails: raise RuntimeError (all retries exhausted)
 ```
-
-This handles transient errors like network timeouts or rate limiting.
-
-##### `_build_contents(chat_history) → list[Content]` (static method)
-
-Converts our internal chat format to Gemini's expected format:
-
-```python
-# Our format:
-{"role": "assistant", "content": "Hello"}
-
-# Gemini's format (note: "assistant" → "model"):
-Content(role="model", parts=[Part.from_text(text="Hello")])
-```
-
-**Important:** Gemini uses `"model"` instead of `"assistant"` for bot messages.
-This method handles that translation.
 
 ---
 
@@ -286,11 +282,11 @@ Anything else (including LLM hallucinations) is rejected as AMBIGUOUS.
 
 ```python
 class IntentReformulator:
-    def __init__(self, llm_client: GeminiClient, system_prompt: str)
+    def __init__(self, llm_client: BaseLLMClient, system_prompt: str)
 ```
 
 **Constructor Parameters:**
-- `llm_client` — An instance of `GeminiClient`
+- `llm_client` — Any LLM client instance (GeminiClient or OpenAIClient)
 - `system_prompt` — The prompt string loaded from YAML
 
 ##### `process_chat(chat_history) → dict`
@@ -367,9 +363,9 @@ becomes `"Cancel Order"`.
 The main loop. Here's the complete flow:
 
 ```
-1. Load .env → get API key
+1. Load .env → get provider + API key
 2. Validate API key exists
-3. Initialize: GeminiClient → ChatMemory → IntentReformulator
+3. Initialize: create_llm_client() → ChatMemory → IntentReformulator
 4. LOOP:
    a. Get user input
    b. If "quit"/"exit" → break
@@ -440,7 +436,9 @@ These call the **real Gemini API** to verify end-to-end behavior.
 | `test_ambiguous_integration` | Real LLM returns unknown for "I'm confused." |
 | `test_refund_request_integration` | Real LLM extracts refund intent correctly |
 
-These tests are **skipped automatically** if `GEMINI_API_KEY` is not set in `.env`.
+These tests exist for **both providers** (`TestIntegrationWithGemini` and
+`TestIntegrationWithOpenAI`). They are **skipped automatically** if the respective
+API key is not set in `.env`.
 
 **Run commands:**
 ```bash
@@ -496,21 +494,31 @@ This project is the **boundary between uncertain knowledge (LLM) and certain act
 - **At the boundary:** User confirms (Yes/No)
 - **After the boundary:** Deterministic code executes with 100% certainty
 
-### 4.4 Structured Output (Pydantic + Gemini)
+### 4.4 Structured Output (Pydantic + LLM)
 
 Instead of asking the LLM to output free text and then parsing it with regex,
-we use Gemini's `response_schema` feature:
+we use each provider's JSON enforcement feature:
 
+**Gemini:**
 ```python
 config=types.GenerateContentConfig(
     response_mime_type="application/json",  # Force JSON output
-    response_schema=IntentOutput,           # Force this exact shape
-    temperature=0,                          # Deterministic output
+    response_schema=IntentOutput,           # Force this exact Pydantic shape
+    temperature=0,
 )
 ```
 
-The Gemini API **guarantees** the output will be valid JSON matching `IntentOutput`.
-This eliminates parsing errors and makes the system much more reliable.
+**OpenAI:**
+```python
+response = client.chat.completions.create(
+    response_format={"type": "json_object"},  # Force JSON output
+    temperature=0,
+)
+# Then validate with Pydantic:
+IntentOutput.model_validate_json(response.choices[0].message.content)
+```
+
+Both approaches ensure the output is valid JSON. Pydantic validates the structure.
 
 ### 4.5 Temperature = 0
 

@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from src.llm_client import GeminiClient
+from src.llm_client import BaseLLMClient
 
 logger = logging.getLogger(__name__)
 
@@ -34,12 +34,12 @@ class IntentReformulator:
     allowed intents list.
     """
 
-    def __init__(self, llm_client: GeminiClient, system_prompt: str) -> None:
+    def __init__(self, llm_client: BaseLLMClient, system_prompt: str) -> None:
         """
         Initialize the IntentReformulator.
 
         Args:
-            llm_client: An instance of GeminiClient for LLM calls.
+            llm_client: An LLM client instance (GeminiClient or OpenAIClient).
             system_prompt: The system prompt loaded from YAML.
         """
         self.llm = llm_client

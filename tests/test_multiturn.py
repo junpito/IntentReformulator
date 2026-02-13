@@ -2,7 +2,7 @@
 Golden Test Cases for LLM Intent Reformulator
 
 Contains both unit tests (with mocked LLM) and integration tests (with real API).
-Unit tests run without an API key; integration tests require GEMINI_API_KEY in .env.
+Unit tests run without an API key; integration tests require API keys in .env.
 
 Run unit tests:     pytest tests/ -v
 Run all tests:      pytest tests/ -v -m "integration or not integration"
@@ -17,7 +17,13 @@ from unittest.mock import MagicMock
 import pytest
 from dotenv import load_dotenv
 
-from src.llm_client import GeminiClient, IntentOutput
+from src.llm_client import (
+    BaseLLMClient,
+    GeminiClient,
+    IntentOutput,
+    OpenAIClient,
+    create_llm_client,
+)
 from src.memory import ChatMemory
 from src.reformulator import ALLOWED_INTENTS, IntentReformulator
 
@@ -76,6 +82,39 @@ class TestChatMemory:
 
 
 # ===========================================================================
+# Unit Tests — Factory Function
+# ===========================================================================
+
+class TestCreateLLMClient:
+    """Tests for the create_llm_client factory function."""
+
+    def test_unknown_provider_raises_error(self):
+        with pytest.raises(ValueError, match="Unknown LLM provider"):
+            create_llm_client(provider="unsupported", api_key="fake-key")
+
+    def test_provider_name_is_case_insensitive(self):
+        """Provider name should be case-insensitive and strip whitespace."""
+        # These should not raise ValueError (they will fail at API init,
+        # but the provider lookup itself should succeed)
+        # We test by checking the error is NOT a ValueError about unknown provider
+        for name in ["GEMINI", " Gemini ", "gemini"]:
+            try:
+                create_llm_client(provider=name, api_key="fake-key")
+            except ValueError:
+                pytest.fail(f"Provider '{name}' was not recognized")
+            except Exception:
+                pass  # Other errors (e.g., API init) are fine
+
+        for name in ["OPENAI", " OpenAI ", "openai"]:
+            try:
+                create_llm_client(provider=name, api_key="fake-key")
+            except ValueError:
+                pytest.fail(f"Provider '{name}' was not recognized")
+            except Exception:
+                pass
+
+
+# ===========================================================================
 # Unit Tests — IntentReformulator (with Mocked LLM)
 # ===========================================================================
 
@@ -84,7 +123,7 @@ class TestIntentReformulatorMocked:
 
     def _make_reformulator(self, verb: str, obj: str | None) -> IntentReformulator:
         """Helper to create a reformulator with a mocked LLM returning fixed output."""
-        mock_client = MagicMock(spec=GeminiClient)
+        mock_client = MagicMock(spec=BaseLLMClient)
         mock_client.generate_structured_output.return_value = IntentOutput(
             verb=verb, object=obj
         )
@@ -160,7 +199,7 @@ class TestIntentReformulatorMocked:
 
     def test_empty_history_returns_ambiguous(self):
         """Empty chat history should return AMBIGUOUS."""
-        mock_client = MagicMock(spec=GeminiClient)
+        mock_client = MagicMock(spec=BaseLLMClient)
         reformulator = IntentReformulator(
             llm_client=mock_client, system_prompt="test prompt"
         )
@@ -182,14 +221,19 @@ class TestIntentReformulatorMocked:
 
 
 # ===========================================================================
-# Integration Tests — Requires real GEMINI_API_KEY
+# Integration Tests — Requires real API keys
 # ===========================================================================
 
 load_dotenv()
 
-HAS_API_KEY = bool(
+HAS_GEMINI_KEY = bool(
     os.getenv("GEMINI_API_KEY")
     and os.getenv("GEMINI_API_KEY") != "your-api-key-here"
+)
+
+HAS_OPENAI_KEY = bool(
+    os.getenv("OPENAI_API_KEY")
+    and os.getenv("OPENAI_API_KEY") != "your-api-key-here"
 )
 
 
@@ -200,8 +244,10 @@ def _load_system_prompt() -> str:
         return yaml.safe_load(f)["system_prompt"]
 
 
+# --- Gemini Integration Tests ---
+
 @pytest.mark.integration
-@pytest.mark.skipif(not HAS_API_KEY, reason="GEMINI_API_KEY not set")
+@pytest.mark.skipif(not HAS_GEMINI_KEY, reason="GEMINI_API_KEY not set")
 class TestIntegrationWithGemini:
     """Integration tests that call the real Gemini API."""
 
@@ -247,6 +293,63 @@ class TestIntegrationWithGemini:
 
     def test_refund_request_integration(self, reformulator):
         """Integration test: Simple refund request."""
+        chat_history = [
+            {"role": "user", "content": "I want a refund for my broken headphones."},
+        ]
+
+        result = reformulator.process_chat(chat_history)
+
+        assert result["status"] == "PROPOSED"
+        assert result["intent"] == "refund"
+        assert result["target"] is not None
+
+
+# --- OpenAI Integration Tests ---
+
+@pytest.mark.integration
+@pytest.mark.skipif(not HAS_OPENAI_KEY, reason="OPENAI_API_KEY not set")
+class TestIntegrationWithOpenAI:
+    """Integration tests that call the real OpenAI API."""
+
+    @pytest.fixture
+    def reformulator(self) -> IntentReformulator:
+        api_key = os.getenv("OPENAI_API_KEY")
+        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        client = OpenAIClient(api_key=api_key, model=model)
+        prompt = _load_system_prompt()
+        return IntentReformulator(llm_client=client, system_prompt=prompt)
+
+    def test_multiturn_cancel_order_integration(self, reformulator):
+        """
+        Integration Golden Test: Multi-turn cancel order via OpenAI.
+        """
+        chat_history = [
+            {"role": "user", "content": "Hi, can I check the status of order #001?"},
+            {"role": "assistant", "content": "Your order #001 is currently being shipped."},
+            {"role": "user", "content": "Actually, just cancel it."},
+        ]
+
+        result = reformulator.process_chat(chat_history)
+
+        assert result["status"] == "PROPOSED"
+        assert result["intent"] == "cancel_order"
+        assert "#001" in (result["target"] or "")
+
+    def test_ambiguous_integration(self, reformulator):
+        """
+        Integration Golden Test: Ambiguous input via OpenAI.
+        """
+        chat_history = [
+            {"role": "user", "content": "I'm confused."},
+        ]
+
+        result = reformulator.process_chat(chat_history)
+
+        assert result["status"] == "AMBIGUOUS"
+        assert result["intent"] is None
+
+    def test_refund_request_integration(self, reformulator):
+        """Integration test: Simple refund request via OpenAI."""
         chat_history = [
             {"role": "user", "content": "I want a refund for my broken headphones."},
         ]
